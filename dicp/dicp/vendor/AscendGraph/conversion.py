@@ -1514,3 +1514,133 @@ class AtenToAscendTransformer(SingleOpTransformer):
     @register_conversion(torch.ops.aten.scalar_tensor.default)
     def scalar_tensor(self, x, dtype=None, layout=None, device=None, pin_memory=None):
         return self.get_const_proxy(x, dtype)
+
+    @register_conversion(torch.ops.lightllm.rotary_emb.default)
+    def lightllm_rotary_emb(self, x, cos, sin):
+        x_shape = list(x.node.meta['val'].shape)
+        if len(x_shape) != 3:
+            import pdb;pdb.set_trace()
+            pass
+        assert len(x_shape) == 3
+
+        seq_len = x_shape[0]
+        dim = x_shape[2]
+
+        cos_sin_shape = self.get_const_proxy([seq_len, 1, dim // 2], torch.int32)
+        cos = self.get_proxy(ascend_op.Reshape, (cos, cos_sin_shape))
+        sin = self.get_proxy(ascend_op.Reshape, (sin, cos_sin_shape))
+
+        x = self.get_proxy(ascend_op.Unsqueeze, (x, [0]))
+        cos = self.get_proxy(ascend_op.Tile, (cos, [1, 1, 1, 2]))
+        sin = self.get_proxy(ascend_op.Tile, (sin, [1, 1, 1, 2]))
+
+        out = self.get_proxy(ascend_op.RotaryMul, (x, cos, sin))
+        return self.get_proxy(ascend_op.Squeeze, (out, [0]))
+
+    @register_conversion(torch.ops.lightllm.rms_norm.default)
+    def lightllm_rms_norm(self, x, weight, eps):
+        out = self.get_proxy(ascend_op.RmsNorm, (x, weight, eps))
+        return self.get_proxy(ascend_op.Identity, (out, 0))
+
+    def incre_flash_attention(self, q, k, v, head_num, kv_head_num, dim):
+        k_list = []
+        v_list = []
+        if not isinstance(k, list):
+            k_list.append(k)
+        else:
+            k_list = k
+        if not isinstance(v, list):
+            v_list.append(v)
+        else:
+            v_list = v
+        assert len(k_list) == len(v_list)
+        kv_input_num = len(k_list)
+        out = self.get_proxy(ascend_op.IncreFlashAttention, (q, k_list, v_list, kv_input_num, kv_head_num, head_num, dim, "BSH"))
+        return out
+
+
+    @register_conversion(torch.ops.lightllm.prompt_attention_inference.default)
+    def prompt_attention_inference(self, q, k, v, mask):
+        q_shape = list(q.node.meta['val'].shape)
+        seqlen, head, dim = q_shape[0], q_shape[1], q_shape[2]
+        k_shape = list(k.node.meta['val'].shape)
+        kv_head = k_shape[1]
+        compute_batch = 1
+        q_compute_shape = self.get_shape_proxy([compute_batch, seqlen, head * dim])
+        kv_compute_shape = self.get_shape_proxy([compute_batch, seqlen, kv_head * dim])
+        q = self.get_proxy(ascend_op.Reshape, (q, q_compute_shape))
+        k = self.get_proxy(ascend_op.Reshape, (k, kv_compute_shape))
+        v = self.get_proxy(ascend_op.Reshape, (v, kv_compute_shape))
+
+        fa = self.get_proxy(ascend_op.PromptFlashAttention, (q, k, v, head, kv_head, seqlen, mask, dim))
+
+        out_shape = self.get_shape_proxy([compute_batch, seqlen, head, dim])
+        out = self.get_proxy(ascend_op.Reshape, (fa, out_shape))
+        return out
+
+    @register_conversion(torch.ops.lightllm.flash_attention_inference.default)
+    def flash_attention_inference(self, q, all_k, all_v, current_len, max_len):
+        q_shape = list(q.node.meta['val'].shape)
+        batch, head, dim = q_shape[0], q_shape[1], q_shape[2]
+        k_shape = list(all_k.node.meta['val'].shape)
+        kvhead = k_shape[1]
+        
+        res = []
+        compute_batch = 1
+        select_axis = self.get_const_proxy(0, torch.int32)
+
+        for i in range(batch):
+            current_len = current_len[i]
+            select_index = self.get_const_proxy(i, torch.int32)
+            xq = self.get_proxy(ascend_op.GatherV2, (q, select_index, select_axis))
+
+            kv_start_index = self.get_const_proxy([i * max_len, 0, 0], torch.int32)
+            kv_end_index = self.get_const_proxy([i * max_len + current_len, kvhead, dim], torch.int32)
+            kv_seq_len = current_len
+
+            kv_gather_shape = self.get_shape_proxy([compute_batch, kv_seq_len, kvhead, dim])
+            kv_compute_shape = self.get_shape_proxy([compute_batch, kv_seq_len, kvhead * dim])
+            
+            # fetch k
+            k = self.get_proxy(ascend_op.Slice, (all_k, kv_start_index, kv_end_index))
+            k = self.get_proxy(ascend_op.Reshape, (k, kv_gather_shape))
+            k = self.get_proxy(ascend_op.Reshape, (k, kv_compute_shape))
+
+            # fetch v
+            v = self.get_proxy(ascend_op.Slice, (all_v, kv_start_index, kv_end_index))
+            v = self.get_proxy(ascend_op.Reshape, (v, kv_gather_shape))
+            v = self.get_proxy(ascend_op.Reshape, (v, kv_compute_shape))
+
+            # k,v shape: batch, kv_seq_len, head, dim
+            q_shape = self.get_shape_proxy([compute_batch, 1, head, dim])
+            q_compute_shape = self.get_shape_proxy([compute_batch, 1, head * dim])
+            xq = self.get_proxy(ascend_op.Reshape, (xq, q_shape))
+            xq = self.get_proxy(ascend_op.Reshape, (xq, q_compute_shape))
+            
+            out = self.incre_flash_attention(xq, k, v, kvhead, head, dim)  # q shape is BSH
+            out_shape = self.get_shape_proxy([compute_batch, 1, head, dim])
+            out_shape2 = self.get_shape_proxy([compute_batch, head, dim])
+            out = self.get_proxy(ascend_op.Reshape, (out, out_shape))
+            out = self.get_proxy(ascend_op.Reshape, (out, out_shape2))
+            res.append(out)
+        
+        res = self.get_proxy(ascend_op.ConcatD, (res, 0))
+        return res
+
+    @register_conversion(torch.ops.c10d_functional.all_gather_into_tensor.default)
+    def all_gather_into_tensor(self, x, tag, rankset, group_size):
+        # Todo handle dim later
+        # pass pg
+        rank = torch.distributed.get_rank()
+        pg = torch.distributed.distributed_c10d._find_or_create_pg_by_ranks_and_tag(tag, rankset, group_size)
+        device = torch.distributed.distributed_c10d._get_pg_default_device(pg)
+        process_group_dicl = pg._get_backend(device)
+        hcom_name = process_group_dicl.get_comm_name(rank)
+        out = self.get_proxy(ascend_op.AllGather, (x, group_size, hcom_name))
+        return out
+
+    @register_conversion(torch.ops.c10d_functional.wait_tensor.default)
+    def wait_tensor(self, x):
+        return self.get_proxy(ascend_op.Identity, (x, None))
+
+

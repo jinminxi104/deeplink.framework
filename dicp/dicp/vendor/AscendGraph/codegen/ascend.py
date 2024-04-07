@@ -2,6 +2,7 @@ import json
 import os
 import uuid
 import torch
+import math
 from typing import Any, List
 from torch.fx.node import Node
 from torch._inductor.utils import IndentedBuffer
@@ -11,6 +12,7 @@ from dicp.vendor.AscendGraph.codegen.utils import (
     get_cpp_dtype,
     get_ascend_dtype_num
 )
+from torch.utils._pytree import tree_map_only
 
 graph_id = 0
 
@@ -689,11 +691,13 @@ class AscendOverrides:
     def gen_args(op_var, args_dict, args):
         src_code = IndentedBuffer()
         args_str = [op_var]
-        for i in range(len(args)):
-            if isinstance(args[i], Node):
-                args_str.append(args_dict[args[i].name])
-            else:
-                args_str.append(args[i])
+        args_str.extend(tree_map_only(Node, lambda x: args_dict[x.name], args))
+
+        # for i in range(len(args)):
+        #     if isinstance(args[i], Node):
+        #         args_str.append(args_dict[args[i].name])
+        #     else:
+        #         args_str.append(args[i])
         return src_code, args_str
 
     @staticmethod
@@ -1595,3 +1599,105 @@ class AscendOverrides:
         op.set_input("indices", indices)
         op.set_input("updates", updates)
         return op.to_node()
+
+
+    @staticmethod
+    def RotaryMul(name, x, cos, sin):
+        op = OP(name, "RotaryMul")
+        op.set_input("x", x)
+        op.set_input("r1", cos)
+        op.set_input("r2", sin)
+        return op.to_node()
+
+    @staticmethod
+    def RmsNorm(name, x, weight, eps):
+        op = OP(name, "RmsNorm")
+        op.set_input("x", x)
+        op.set_input("gamma", weight)
+        op.set_attr_float("epsilon", float(eps))
+        return op.to_node()
+
+    @staticmethod
+    def IncreFlashAttention(name, q, k_list, v_list, kv_input_num, head_num, kv_head_num, dim, input_layout="BSH"):
+        op = OP(name, "IncreFlashAttention")
+        op.set_input("query", q)
+        op.set_dynamic_input("key", kv_input_num, k_list)
+        op.set_dynamic_input("value", kv_input_num, v_list)
+        op.set_attr_int("num_heads", head_num)
+        op.set_attr_int("num_key_value_heads", kv_head_num)
+        op.set_attr_float("scale_value", float(1 / math.sqrt(dim)))
+        op.set_attr_str("input_layout", input_layout)
+        return op.to_node()
+
+    @staticmethod
+    def Gather(name, x, indices):
+        gather_op = OP(name, "Gather")
+        gather_op.set_input("x", x)
+        gather_op.set_input("indices", indices)
+        return gather_op.to_node()
+
+
+    @staticmethod
+    def ExpandDims(name, x, axis):
+        gather_op = OP(name, "ExpandDims")
+        gather_op.set_input("x", x)
+        gather_op.set_input("axis", axis)
+        return gather_op.to_node()
+
+    @staticmethod
+    def InplaceCopyWithOffset(name, x, src, dim, offset):
+        op = OP(name, "Identity")
+        op.set_input("x", src)
+        return op.to_node()
+
+    @staticmethod
+    def MaskedScatter(name, x, mask, updates):
+        op = OP(name, "MaskedScatter")
+        op.set_input("x", x)
+        op.set_input("mask", mask)
+        op.set_input("updates", updates)
+        return op.to_node()
+
+    @staticmethod
+    def ViewCopy(name, dst, dst_size, dst_stride, dst_storage_offset, src, src_size, src_stride, src_storage_offset):
+        op = OP(name, "ViewCopy")
+        op.set_input("dst", dst)
+        op.set_input("dst_size", dst_size)
+        op.set_input("dst_stride", dst_stride)
+        op.set_input("dst_storage_offset", dst_storage_offset)
+        op.set_input("src", src)
+        op.set_input("src_size", src_size)
+        op.set_input("src_stride", src_stride)
+        op.set_input("src_storage_offset", src_storage_offset)
+        return op.to_node()
+
+    @staticmethod
+    def ScatterNdUpdate(name, x, indices, updates):
+        op = OP(name, "ScatterNdUpdate")
+        op.set_input("var", x)
+        op.set_input("indices", indices)
+        op.set_input("updates", updates)
+        return op.to_node()
+
+    @staticmethod
+    def PromptFlashAttention(name, q, k, v, head_num, kv_head, seqlen, mask, head_dim):
+        op = OP(name, "PromptFlashAttention")
+        op.set_input("query", q)
+        op.set_input("key", k)
+        op.set_input("value", v)
+        op.set_input("atten_mask", mask)
+        op.set_attr_int("num_heads", head_num)
+        op.set_attr_float("scale_value", float(1 / math.sqrt(head_dim)))
+        op.set_attr_str("input_layout", "BSH")
+        op.set_attr_int("num_key_value_heads", kv_head)
+        return op.to_node()
+
+    @staticmethod
+    def AllGather(name, x, group_size, tag):
+        op = OP(name, "HcomAllGather")
+        op.set_input("x", x)
+        op.set_attr_int("rank_size", group_size)
+        op.set_attr_str("group", tag)
+        return op.to_node()
+
+
